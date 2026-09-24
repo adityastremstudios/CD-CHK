@@ -22,6 +22,7 @@ DONE_MSG = os.environ.get("DONE_MSG", "Sab numbers use ho gaye. Update jald aaye
 
 app = Flask(__name__)
 app.config["MAX_FORM_MEMORY_SIZE"] = 50_000_000  # badi list paste karne ke liye
+app.config["MAX_CONTENT_LENGTH"] = 20_000_000  # ek upload me total 20 MB tak
 
 
 @contextmanager
@@ -48,6 +49,24 @@ def init_db():
                 used_at TIMESTAMPTZ)"""
         )
         c.execute("CREATE INDEX IF NOT EXISTS numbers_unused_idx ON numbers(id) WHERE NOT used")
+
+
+def read_text(f):
+    """Uploaded file ko text me badlo (UTF-8 ya Notepad ka UTF-16)."""
+    raw = f.read()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = raw.decode("utf-16", errors="replace")
+    else:
+        text = raw.decode("utf-8-sig", errors="replace")
+    return text.replace("\x00", "")
+
+
+def submitted_values():
+    """Form ke textarea aur uploaded .txt files se numbers (unique, order ke saath)."""
+    chunks = [request.form.get("nums", "")]
+    chunks += [read_text(f) for f in request.files.getlist("file") if f and f.filename]
+    lines = (v.strip() for chunk in chunks for v in chunk.splitlines())
+    return list(dict.fromkeys(v for v in lines if v))
 
 
 def admin_only(f):
@@ -121,16 +140,37 @@ button.danger{background:var(--danger)}
 button:focus-visible{outline:3px solid var(--ink);outline-offset:3px}
 .note{color:var(--accent);font-weight:600}
 form+form{margin-top:1.5rem}
+input[type=file]{display:block;margin:.4rem 0 1rem;max-width:100%}
+.hint{color:var(--muted);margin:.25rem 0}
+h2{font-size:1.1rem;margin:0 0 .5rem}
 </style></head><body><main>
 <h1>Numbers manage karo</h1>
 <p class="counts">Total {{t}}, use hue {{u}}, bache {{t-u}}</p>
-{% if added is not none %}<p class="note">{{added}} naye number add hue, duplicates skip kar diye.</p>{% endif %}
-<form method="post" action="/admin/add">
-  <textarea name="nums" rows="10" placeholder="Ek line me ek number"></textarea>
+{% if added is not none %}<p class="note">{{added}} naye number add hue, {{dupes or 0}} pehle se the (skip kar diye).</p>{% endif %}
+{% if deleted is not none %}<p class="note">{{deleted}} number delete hue.</p>{% endif %}
+<form method="post" action="/admin/add" enctype="multipart/form-data">
+  <label for="file">.txt file se add karo (ek line me ek number, ek se zyada file bhi chalegi)</label>
+  <input id="file" type="file" name="file" accept=".txt,text/plain" multiple>
+  <p class="hint">ya seedha yahan paste karo</p>
+  <textarea name="nums" rows="8" placeholder="Ek line me ek number"></textarea>
   <button>Numbers add karo</button>
 </form>
 <form method="post" action="/admin/reset" onsubmit="return confirm('Sab numbers wapas unused ho jayenge aur dobara aa sakte hain. Pakka?')">
   <button class="danger">Sab unused kar do</button>
+</form>
+<form method="post" action="/admin/delete" enctype="multipart/form-data">
+  <h2>Kuch numbers delete karo</h2>
+  <label for="dfile">.txt file se (ek line me ek number)</label>
+  <input id="dfile" type="file" name="file" accept=".txt,text/plain" multiple>
+  <p class="hint">ya seedha yahan paste karo</p>
+  <textarea name="nums" rows="5" placeholder="Jo numbers delete karne hain"></textarea>
+  <button class="danger" onclick="return confirm('Ye numbers delete ho jayenge. Pakka?')">Ye numbers delete karo</button>
+</form>
+<form method="post" action="/admin/delete-unused" onsubmit="return confirm('Jo numbers abhi tak nikle nahi wo sab delete ho jayenge. Pakka?')">
+  <button class="danger">Bache hue (unused) sab delete karo</button>
+</form>
+<form method="post" action="/admin/delete-all" onsubmit="return confirm('Poora data delete ho jayega, use ho chuke numbers ka record bhi. Pakka?')">
+  <button class="danger">Poora data delete karo</button>
 </form>
 </main></body></html>"""
 
@@ -163,14 +203,15 @@ def admin():
         c.execute("SELECT COUNT(*), COUNT(*) FILTER (WHERE used) FROM numbers")
         t, u = c.fetchone()
     added = request.args.get("added", type=int)
-    return render_template_string(ADMIN, t=t, u=u, added=added)
+    dupes = request.args.get("dupes", type=int)
+    deleted = request.args.get("deleted", type=int)
+    return render_template_string(ADMIN, t=t, u=u, added=added, dupes=dupes, deleted=deleted)
 
 
 @app.post("/admin/add")
 @admin_only
 def admin_add():
-    lines = (v.strip() for v in request.form.get("nums", "").splitlines())
-    values = list(dict.fromkeys(v for v in lines if v))
+    values = submitted_values()
     added = 0
     if values:
         with cursor() as c:
@@ -178,11 +219,11 @@ def admin_add():
                 c,
                 "INSERT INTO numbers(value) VALUES %s ON CONFLICT DO NOTHING RETURNING 1",
                 [(v,) for v in values],
-                page_size=1000,
+                page_size=10000,
                 fetch=True,
             )
             added = len(rows)
-    return redirect(f"/admin?added={added}")
+    return redirect(f"/admin?added={added}&dupes={len(values) - added}")
 
 
 @app.post("/admin/reset")
@@ -191,6 +232,37 @@ def admin_reset():
     with cursor() as c:
         c.execute("UPDATE numbers SET used = FALSE, used_at = NULL")
     return redirect("/admin")
+
+
+@app.post("/admin/delete")
+@admin_only
+def admin_delete():
+    values = submitted_values()
+    deleted = 0
+    if values:
+        with cursor() as c:
+            c.execute("DELETE FROM numbers WHERE value = ANY(%s)", (values,))
+            deleted = c.rowcount
+    return redirect(f"/admin?deleted={deleted}")
+
+
+@app.post("/admin/delete-unused")
+@admin_only
+def admin_delete_unused():
+    with cursor() as c:
+        c.execute("DELETE FROM numbers WHERE NOT used")
+        deleted = c.rowcount
+    return redirect(f"/admin?deleted={deleted}")
+
+
+@app.post("/admin/delete-all")
+@admin_only
+def admin_delete_all():
+    with cursor() as c:
+        c.execute("SELECT COUNT(*) FROM numbers")
+        deleted = c.fetchone()[0]
+        c.execute("TRUNCATE numbers RESTART IDENTITY")
+    return redirect(f"/admin?deleted={deleted}")
 
 
 init_db()
